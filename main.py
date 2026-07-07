@@ -32,7 +32,7 @@ R2_ENDPOINT = os.getenv("R2_ENDPOINT")
 app = FastAPI(
     title="SmartLead Webhook Receiver",
     description="Receives and stores SmartLead EMAIL_SENT and EMAIL_BOUNCE webhooks",
-    version="2.0.0"
+    version="2.1.0"
 )
 
 # ============================================================================
@@ -208,10 +208,41 @@ async def store_email_sent(event: EmailSentEvent, raw_payload: dict):
         logger.error(f"❌ Error storing EMAIL_SENT: {str(e)}")
 
 
+async def store_bounce_to_neon(event: EmailBounceEvent, raw_storage_path: str):
+    """Store bounce event to Neon"""
+    try:
+        conn = await get_neon_connection()
+
+        try:
+            await conn.execute(
+                """
+                INSERT INTO email_bounce_events (
+                    message_id, from_email, to_email, bounce_type, bounce_reason,
+                    campaign_id, time_bounced, raw_storage_path
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                """,
+                event.message_id,
+                event.from_email,
+                event.to_email,
+                event.bounce_type,
+                event.bounce_reason,
+                event.campaign_id,
+                event.time_bounced,
+                raw_storage_path
+            )
+
+            logger.info(f"🗄️ Stored bounce to Neon: {event.message_id or 'no-id'}")
+
+        finally:
+            await conn.close()
+
+    except Exception as e:
+        logger.error(f"❌ Failed to store bounce to Neon: {str(e)}")
+
+
 async def store_email_bounce(event: EmailBounceEvent, raw_payload: dict):
     """
-    Store EMAIL_BOUNCE event to R2 only
-    (Neon storage for bounces can be added later if needed)
+    Store EMAIL_BOUNCE event to R2 (raw) and Neon (normalized)
     """
     logger.info(f"💥 EMAIL_BOUNCE: {event.from_email} → {event.to_email} | Type: {event.bounce_type} | Reason: {event.bounce_reason}")
     logger.info(f"   Campaign ID: {event.campaign_id}")
@@ -223,6 +254,9 @@ async def store_email_bounce(event: EmailBounceEvent, raw_payload: dict):
         # Store raw payload to R2
         message_id = event.message_id or f"bounce-{datetime.now(timezone.utc).timestamp()}"
         raw_storage_path = await store_raw_to_r2(raw_payload, message_id, "EMAIL_BOUNCE")
+
+        # Store normalized data to Neon
+        await store_bounce_to_neon(event, raw_storage_path)
 
         logger.info(f"✅ Successfully stored EMAIL_BOUNCE: {message_id}")
 
