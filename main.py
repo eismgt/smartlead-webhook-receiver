@@ -348,6 +348,9 @@ async def handle_email_bounce(request: Request, background_tasks: BackgroundTask
     """
     raw_payload = await request.json()
 
+    # TEMPORARY: Log raw payload to see actual structure
+    logger.info(f"🔍 RAW BOUNCE PAYLOAD: {json.dumps(raw_payload, indent=2)}")
+
     try:
         # Validate structure
         event = EmailBounceEvent(**raw_payload)
