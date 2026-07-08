@@ -6,6 +6,7 @@ Stores raw JSON to R2 and normalized data to Neon
 import os
 import logging
 import json
+import re
 import boto3
 from datetime import datetime, timezone
 from typing import Optional
@@ -93,56 +94,54 @@ class EmailSentEvent(BaseModel):
         }
 
 
-class LeadInfo(BaseModel):
-    """Nested lead object in SmartLead bounce webhook"""
-    email: EmailStr
-    first_name: Optional[str] = None
-    last_name: Optional[str] = None
-    company_name: Optional[str] = None
-    custom_fields: Optional[dict] = None
+class SentMessage(BaseModel):
+    """Nested sent_message object in actual SmartLead bounce webhook"""
+    message_id: str
+    html: Optional[str] = None
+    text: Optional[str] = None
+    time: datetime
 
 
-class EmailInfo(BaseModel):
-    """Nested email object in SmartLead bounce webhook"""
-    subject: Optional[str] = None
-    message_id: Optional[str] = None
+class BounceMessage(BaseModel):
+    """Nested bounce_message object in actual SmartLead bounce webhook"""
+    message_id: str
+    html: Optional[str] = None
+    text: Optional[str] = None
+    time: datetime
+
+
+class Metadata(BaseModel):
+    """Metadata object in SmartLead webhook"""
+    webhook_created_at: Optional[datetime] = None
 
 
 class EmailBounceEvent(BaseModel):
-    """SmartLead EMAIL_BOUNCED webhook payload (actual format from SmartLead docs)"""
-    event: str = Field(default="EMAIL_BOUNCED")
-    timestamp: datetime
-    campaign_id: int
-    campaign_name: Optional[str] = None
-    lead_id: Optional[int] = None
-    email_account_id: Optional[int] = None
-    lead: LeadInfo
-    sequence_number: Optional[int] = None
-    email: Optional[EmailInfo] = None
-
-    class Config:
-        json_schema_extra = {
-            "example": {
-                "event": "EMAIL_BOUNCED",
-                "timestamp": "2024-01-15T10:30:00Z",
-                "campaign_id": 123,
-                "campaign_name": "Cold Outreach Q1",
-                "lead_id": 789,
-                "email_account_id": 456,
-                "lead": {
-                    "email": "lead@example.com",
-                    "first_name": "Jane",
-                    "last_name": "Doe",
-                    "company_name": "Acme Corp",
-                    "custom_fields": {"job_title": "CEO"}
-                },
-                "sequence_number": 1,
-                "email": {
-                    "subject": "Quick question",
-                    "message_id": "abc123@smartlead.ai"
-                }
-            }
-        }
+    """SmartLead EMAIL_BOUNCE webhook payload (actual format from SmartLead)"""
+    event_type: str = Field(default="EMAIL_BOUNCE")
+    campaign_name: str
+    sl_email_lead_id: str
+    campaign_status: Optional[str] = None
+    client_id: Optional[int] = None
+    stats_id: Optional[str] = None
+    custom_email_message: Optional[str] = None
+    sent_message_body: Optional[str] = None
+    sent_message: SentMessage
+    subject: Optional[str] = None
+    message_id: str
+    is_bounced: bool
+    is_sender_originated_bounce: Optional[bool] = None
+    bounce_reply_message_id: Optional[str] = None
+    bounce_reply_email: Optional[str] = None
+    bounce_reply_email_preview: Optional[str] = None
+    bounce_message: BounceMessage
+    secret_key: Optional[str] = None
+    app_url: Optional[str] = None
+    ui_master_inbox_link: Optional[str] = None
+    description: Optional[str] = None
+    metadata: Optional[Metadata] = None
+    webhook_url: Optional[str] = None
+    webhook_id: Optional[int] = None
+    webhook_name: Optional[str] = None
 
 
 # ============================================================================
@@ -234,7 +233,7 @@ async def store_email_sent(event: EmailSentEvent, raw_payload: dict):
         logger.error(f"❌ Error storing EMAIL_SENT: {str(e)}")
 
 
-async def store_bounce_to_neon(event: EmailBounceEvent, raw_storage_path: str):
+async def store_bounce_to_neon(event: EmailBounceEvent, raw_storage_path: str, lead_email: str):
     """Store bounce event to Neon"""
     try:
         conn = await get_neon_connection()
@@ -243,23 +242,22 @@ async def store_bounce_to_neon(event: EmailBounceEvent, raw_storage_path: str):
             await conn.execute(
                 """
                 INSERT INTO email_bounce_events (
-                    to_email, campaign_id, campaign_name,
-                    time_bounced, raw_storage_path, lead_id,
-                    email_account_id, sequence_number, subject
+                    to_email, campaign_name, time_bounced, raw_storage_path,
+                    lead_id, message_id, subject, bounce_reason, is_sender_originated
                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
                 """,
-                event.lead.email,
-                event.campaign_id,
+                lead_email,
                 event.campaign_name,
-                event.timestamp,
+                event.bounce_message.time,
                 raw_storage_path,
-                event.lead_id,
-                event.email_account_id,
-                event.sequence_number,
-                event.email.subject if event.email else None
+                event.sl_email_lead_id,
+                event.message_id,
+                event.subject,
+                event.bounce_reply_email_preview,
+                event.is_sender_originated_bounce
             )
 
-            logger.info(f"🗄️ Stored bounce to Neon: {event.lead.email}")
+            logger.info(f"🗄️ Stored bounce to Neon: {lead_email}")
 
         finally:
             await conn.close()
@@ -268,28 +266,39 @@ async def store_bounce_to_neon(event: EmailBounceEvent, raw_storage_path: str):
         logger.error(f"❌ Failed to store bounce to Neon: {str(e)}")
 
 
+def extract_email_from_description(description: Optional[str]) -> Optional[str]:
+    """Extract email address from description field"""
+    if not description:
+        return None
+    # Pattern: "sent to email@example.com got bounced"
+    match = re.search(r'sent to ([\w\.-@]+)\s+got bounced', description)
+    return match.group(1) if match else None
+
+
 async def store_email_bounce(event: EmailBounceEvent, raw_payload: dict):
     """
     Store BOUNCED event to R2 (raw) and Neon (normalized)
     """
-    logger.info(f"💥 BOUNCED: {event.lead.email} | Campaign: {event.campaign_name} ({event.campaign_id})")
-    logger.info(f"   Lead: {event.lead.first_name} {event.lead.last_name}")
-    logger.info(f"   Subject: {event.email.subject if event.email else 'N/A'}")
-    logger.info(f"   Time: {event.timestamp}")
+    # Extract lead email from description
+    lead_email = extract_email_from_description(event.description)
+
+    logger.info(f"💥 BOUNCED: {lead_email or 'unknown'} | Campaign: {event.campaign_name}")
+    logger.info(f"   Subject: {event.subject}")
+    logger.info(f"   Bounce reason: {event.bounce_reply_email_preview}")
+    logger.info(f"   Time bounced: {event.bounce_message.time}")
 
     try:
-        # Generate unique ID for storage using message_id if available
-        message_id = event.email.message_id if event.email else None
-        if message_id:
-            bounce_id = message_id
-        else:
-            bounce_id = f"bounce-{event.campaign_id}-{event.lead.email}-{int(event.timestamp.timestamp())}"
+        # Use message_id for storage
+        bounce_id = event.message_id
 
         # Store raw payload to R2
         raw_storage_path = await store_raw_to_r2(raw_payload, bounce_id, "BOUNCED")
 
         # Store normalized data to Neon
-        await store_bounce_to_neon(event, raw_storage_path)
+        if lead_email:
+            await store_bounce_to_neon(event, raw_storage_path, lead_email)
+        else:
+            logger.warning(f"⚠️ Could not extract lead email from description")
 
         logger.info(f"✅ Successfully stored BOUNCED: {bounce_id}")
 
@@ -358,14 +367,13 @@ async def handle_email_bounce(request: Request, background_tasks: BackgroundTask
         # Queue background processing (fast ACK)
         background_tasks.add_task(store_email_bounce, event, raw_payload)
 
-        message_id = event.email.message_id if event.email else "no-id"
-        logger.info(f"✅ Queued EMAIL_BOUNCE webhook: {message_id}")
+        logger.info(f"✅ Queued EMAIL_BOUNCE webhook: {event.message_id}")
 
         return JSONResponse(
             status_code=200,
             content={
                 "status": "received",
-                "lead_email": event.lead.email,
+                "message_id": event.message_id,
                 "event_type": "EMAIL_BOUNCE"
             }
         )
