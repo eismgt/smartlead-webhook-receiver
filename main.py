@@ -94,27 +94,31 @@ class EmailSentEvent(BaseModel):
 
 
 class EmailBounceEvent(BaseModel):
-    """SmartLead EMAIL_BOUNCE webhook payload"""
-    event_type: str = Field(default="EMAIL_BOUNCE")
-    from_email: EmailStr
-    to_email: EmailStr
-    bounce_type: str  # "hard" or "soft"
-    bounce_reason: Optional[str] = None
-    campaign_id: Optional[int] = None
-    message_id: Optional[str] = None
-    time_bounced: Optional[datetime] = None
+    """SmartLead BOUNCED webhook payload (actual format from SmartLead)"""
+    event_type: str = Field(default="BOUNCED")
+    campaign_id: int
+    lead_email: EmailStr
+    lead_first_name: Optional[str] = None
+    lead_last_name: Optional[str] = None
+    email_account: EmailStr
+    subject: Optional[str] = None
+    message: Optional[str] = None  # Bounce description
+    timestamp: datetime
+    category_id: Optional[int] = None
 
     class Config:
         json_schema_extra = {
             "example": {
-                "event_type": "EMAIL_BOUNCE",
-                "from_email": "sender@company.com",
-                "to_email": "lead@example.com",
-                "bounce_type": "hard",
-                "bounce_reason": "mailbox full",
+                "event_type": "BOUNCED",
                 "campaign_id": 123,
-                "message_id": "abc123",
-                "time_bounced": "2025-01-15T09:05:00Z"
+                "lead_email": "prospect@example.com",
+                "lead_first_name": "John",
+                "lead_last_name": "Doe",
+                "email_account": "sender@yourdomain.com",
+                "subject": "Quick question",
+                "message": "Bounce description",
+                "timestamp": "2025-11-26T10:30:00Z",
+                "category_id": 5
             }
         }
 
@@ -217,21 +221,20 @@ async def store_bounce_to_neon(event: EmailBounceEvent, raw_storage_path: str):
             await conn.execute(
                 """
                 INSERT INTO email_bounce_events (
-                    message_id, from_email, to_email, bounce_type, bounce_reason,
-                    campaign_id, time_bounced, raw_storage_path
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                    from_email, to_email, bounce_reason, campaign_id,
+                    time_bounced, raw_storage_path, category_id
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7)
                 """,
-                event.message_id,
-                event.from_email,
-                event.to_email,
-                event.bounce_type,
-                event.bounce_reason,
+                event.email_account,
+                event.lead_email,
+                event.message,
                 event.campaign_id,
-                event.time_bounced,
-                raw_storage_path
+                event.timestamp,
+                raw_storage_path,
+                event.category_id
             )
 
-            logger.info(f"🗄️ Stored bounce to Neon: {event.message_id or 'no-id'}")
+            logger.info(f"🗄️ Stored bounce to Neon: {event.lead_email}")
 
         finally:
             await conn.close()
@@ -242,26 +245,27 @@ async def store_bounce_to_neon(event: EmailBounceEvent, raw_storage_path: str):
 
 async def store_email_bounce(event: EmailBounceEvent, raw_payload: dict):
     """
-    Store EMAIL_BOUNCE event to R2 (raw) and Neon (normalized)
+    Store BOUNCED event to R2 (raw) and Neon (normalized)
     """
-    logger.info(f"💥 EMAIL_BOUNCE: {event.from_email} → {event.to_email} | Type: {event.bounce_type} | Reason: {event.bounce_reason}")
-    logger.info(f"   Campaign ID: {event.campaign_id}")
-    logger.info(f"   Message ID: {event.message_id}")
-    if event.time_bounced:
-        logger.info(f"   Time: {event.time_bounced}")
+    logger.info(f"💥 BOUNCED: {event.email_account} → {event.lead_email} | Campaign: {event.campaign_id}")
+    logger.info(f"   Subject: {event.subject}")
+    logger.info(f"   Message: {event.message}")
+    logger.info(f"   Time: {event.timestamp}")
 
     try:
+        # Generate unique ID for storage
+        bounce_id = f"bounce-{event.campaign_id}-{event.lead_email}-{int(event.timestamp.timestamp())}"
+
         # Store raw payload to R2
-        message_id = event.message_id or f"bounce-{datetime.now(timezone.utc).timestamp()}"
-        raw_storage_path = await store_raw_to_r2(raw_payload, message_id, "EMAIL_BOUNCE")
+        raw_storage_path = await store_raw_to_r2(raw_payload, bounce_id, "BOUNCED")
 
         # Store normalized data to Neon
         await store_bounce_to_neon(event, raw_storage_path)
 
-        logger.info(f"✅ Successfully stored EMAIL_BOUNCE: {message_id}")
+        logger.info(f"✅ Successfully stored BOUNCED: {bounce_id}")
 
     except Exception as e:
-        logger.error(f"❌ Error storing EMAIL_BOUNCE: {str(e)}")
+        logger.error(f"❌ Error storing BOUNCED: {str(e)}")
 
 
 # ============================================================================
