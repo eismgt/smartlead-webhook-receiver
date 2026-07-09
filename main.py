@@ -7,6 +7,7 @@ import os
 import logging
 import json
 import re
+import asyncio
 import boto3
 from datetime import datetime, timezone
 from typing import Optional
@@ -149,63 +150,85 @@ class EmailBounceEvent(BaseModel):
 # ============================================================================
 
 async def store_raw_to_r2(event_data: dict, message_id: str, event_type: str):
-    """Store raw webhook payload to R2"""
+    """Store raw webhook payload to R2 (non-blocking)"""
     try:
-        s3_client = get_r2_client()
+        # Run boto3 operations in thread pool to avoid blocking event loop
+        def _upload_to_r2():
+            s3_client = get_r2_client()
 
-        # Generate storage path: YYYY/MM/DD/message_id.json
-        now = datetime.now(timezone.utc)
-        path = f"{event_type}/{now.year}/{now.month:02d}/{now.day:02d}/{message_id}.json"
+            # Generate storage path: YYYY/MM/DD/message_id.json
+            now = datetime.now(timezone.utc)
+            path = f"{event_type}/{now.year}/{now.month:02d}/{now.day:02d}/{message_id}.json"
 
-        # Upload to R2
-        s3_client.put_object(
-            Bucket=R2_BUCKET_NAME,
-            Key=path,
-            Body=json.dumps(event_data, default=str),
-            ContentType='application/json'
+            # Upload to R2
+            s3_client.put_object(
+                Bucket=R2_BUCKET_NAME,
+                Key=path,
+                Body=json.dumps(event_data, default=str),
+                ContentType='application/json'
+            )
+            return path
+
+        # Run in thread pool with timeout to avoid hanging
+        path = await asyncio.wait_for(
+            asyncio.to_thread(_upload_to_r2),
+            timeout=10.0  # 10 second timeout
         )
 
         logger.info(f"📦 Stored raw payload to R2: {path}")
         return path
 
+    except asyncio.TimeoutError:
+        logger.error(f"❌ R2 upload timeout for {message_id}")
+        raise
     except Exception as e:
         logger.error(f"❌ Failed to store to R2: {str(e)}")
         raise
 
 
 async def store_to_neon(event: EmailSentEvent, raw_storage_path: str):
-    """Store normalized data to Neon"""
+    """Store normalized data to Neon with timeout"""
     try:
-        conn = await get_neon_connection()
+        # Get connection with timeout
+        conn = await asyncio.wait_for(
+            get_neon_connection(),
+            timeout=5.0
+        )
 
         try:
-            # Insert normalized data
-            await conn.execute(
-                """
-                INSERT INTO email_sent_events (
-                    message_id, from_email, to_email, to_name, time_sent,
-                    campaign_id, campaign_name, sequence_number, custom_subject,
+            # Insert normalized data with timeout
+            await asyncio.wait_for(
+                conn.execute(
+                    """
+                    INSERT INTO email_sent_events (
+                        message_id, from_email, to_email, to_name, time_sent,
+                        campaign_id, campaign_name, sequence_number, custom_subject,
+                        raw_storage_path
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                    ON CONFLICT (message_id) DO NOTHING
+                    """,
+                    event.message_id,
+                    event.from_email,
+                    event.to_email,
+                    event.to_name,
+                    event.time_sent,
+                    event.campaign_id,
+                    event.campaign_name,
+                    event.sequence_number,
+                    event.custom_subject,
                     raw_storage_path
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-                ON CONFLICT (message_id) DO NOTHING
-                """,
-                event.message_id,
-                event.from_email,
-                event.to_email,
-                event.to_name,
-                event.time_sent,
-                event.campaign_id,
-                event.campaign_name,
-                event.sequence_number,
-                event.custom_subject,
-                raw_storage_path
+                ),
+                timeout=5.0
             )
 
             logger.info(f"🗄️ Stored to Neon: {event.message_id}")
 
         finally:
-            await conn.close()
+            await asyncio.wait_for(conn.close(), timeout=2.0)
 
+    except asyncio.TimeoutError:
+        logger.error(f"❌ Neon operation timeout for {event.message_id}")
+        # Don't raise - we don't want to fail the webhook if Neon is slow
     except Exception as e:
         logger.error(f"❌ Failed to store to Neon: {str(e)}")
         # Don't raise - we don't want to fail the webhook if Neon is down
@@ -234,34 +257,44 @@ async def store_email_sent(event: EmailSentEvent, raw_payload: dict):
 
 
 async def store_bounce_to_neon(event: EmailBounceEvent, raw_storage_path: str, lead_email: str):
-    """Store bounce event to Neon"""
+    """Store bounce event to Neon with timeout"""
     try:
-        conn = await get_neon_connection()
+        # Get connection with timeout
+        conn = await asyncio.wait_for(
+            get_neon_connection(),
+            timeout=5.0
+        )
 
         try:
-            await conn.execute(
-                """
-                INSERT INTO email_bounce_events (
-                    to_email, campaign_name, time_bounced, raw_storage_path,
-                    lead_id, message_id, subject, bounce_reason, is_sender_originated
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-                """,
-                lead_email,
-                event.campaign_name,
-                event.bounce_message.time,
-                raw_storage_path,
-                event.sl_email_lead_id,
-                event.message_id,
-                event.subject,
-                event.bounce_reply_email_preview,
-                event.is_sender_originated_bounce
+            # Insert normalized data with timeout
+            await asyncio.wait_for(
+                conn.execute(
+                    """
+                    INSERT INTO email_bounce_events (
+                        to_email, campaign_name, time_bounced, raw_storage_path,
+                        lead_id, message_id, subject, bounce_reason, is_sender_originated
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                    """,
+                    lead_email,
+                    event.campaign_name,
+                    event.bounce_message.time,
+                    raw_storage_path,
+                    event.sl_email_lead_id,
+                    event.message_id,
+                    event.subject,
+                    event.bounce_reply_email_preview,
+                    event.is_sender_originated_bounce
+                ),
+                timeout=5.0
             )
 
             logger.info(f"🗄️ Stored bounce to Neon: {lead_email}")
 
         finally:
-            await conn.close()
+            await asyncio.wait_for(conn.close(), timeout=2.0)
 
+    except asyncio.TimeoutError:
+        logger.error(f"❌ Neon bounce operation timeout for {lead_email}")
     except Exception as e:
         logger.error(f"❌ Failed to store bounce to Neon: {str(e)}")
 
