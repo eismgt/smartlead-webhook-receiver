@@ -96,14 +96,6 @@ async def close_neon_pool():
         neon_pool = None
         logger.info("🔒 Neon connection pool closed")
 
-
-async def get_neon_connection():
-    """Get Neon database connection from pool"""
-    global neon_pool
-    if neon_pool is None:
-        await init_neon_pool()
-    return neon_pool.acquire()
-
 # ============================================================================
 # Pydantic Models for Webhook Validation
 # ============================================================================
@@ -234,8 +226,12 @@ async def store_raw_to_r2(event_data: dict, message_id: str, event_type: str):
 async def store_to_neon(event: EmailSentEvent, raw_storage_path: str):
     """Store normalized data to Neon with timeout using connection pool"""
     try:
+        # Ensure pool is initialized
+        if neon_pool is None:
+            await init_neon_pool()
+
         # Get connection from pool
-        async with get_neon_connection() as conn:
+        async with neon_pool.acquire() as conn:
             # Insert normalized data with timeout
             await asyncio.wait_for(
                 conn.execute(
@@ -296,8 +292,12 @@ async def store_email_sent(event: EmailSentEvent, raw_payload: dict):
 async def store_bounce_to_neon(event: EmailBounceEvent, raw_storage_path: str, lead_email: str):
     """Store bounce event to Neon with timeout using connection pool"""
     try:
+        # Ensure pool is initialized
+        if neon_pool is None:
+            await init_neon_pool()
+
         # Get connection from pool
-        async with get_neon_connection() as conn:
+        async with neon_pool.acquire() as conn:
             # Insert normalized data with timeout
             await asyncio.wait_for(
                 conn.execute(
