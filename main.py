@@ -34,8 +34,24 @@ R2_ENDPOINT = os.getenv("R2_ENDPOINT")
 app = FastAPI(
     title="SmartLead Webhook Receiver",
     description="Receives and stores SmartLead EMAIL_SENT and EMAIL_BOUNCE webhooks",
-    version="2.1.0"
+    version="2.2.0"
 )
+
+
+# ============================================================================
+# Lifecycle Events
+# ============================================================================
+
+@app.on_event("startup")
+async def startup_event():
+    """Initialize connection pool on startup"""
+    await init_neon_pool()
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Close connection pool on shutdown"""
+    await close_neon_pool()
 
 # ============================================================================
 # R2 Client (S3-compatible)
@@ -55,9 +71,38 @@ def get_r2_client():
 # Neon Database Connection Pool
 # ============================================================================
 
+# Global connection pool
+neon_pool: Optional[asyncpg.Pool] = None
+
+
+async def init_neon_pool():
+    """Initialize Neon connection pool"""
+    global neon_pool
+    if neon_pool is None:
+        neon_pool = await asyncpg.create_pool(
+            NEON_DATABASE_URL,
+            min_size=2,
+            max_size=10,
+            command_timeout=5.0
+        )
+        logger.info("✅ Neon connection pool initialized (min=2, max=10)")
+
+
+async def close_neon_pool():
+    """Close Neon connection pool"""
+    global neon_pool
+    if neon_pool:
+        await neon_pool.close()
+        neon_pool = None
+        logger.info("🔒 Neon connection pool closed")
+
+
 async def get_neon_connection():
-    """Get Neon database connection"""
-    return await asyncpg.connect(NEON_DATABASE_URL)
+    """Get Neon database connection from pool"""
+    global neon_pool
+    if neon_pool is None:
+        await init_neon_pool()
+    return neon_pool.acquire()
 
 # ============================================================================
 # Pydantic Models for Webhook Validation
@@ -187,15 +232,10 @@ async def store_raw_to_r2(event_data: dict, message_id: str, event_type: str):
 
 
 async def store_to_neon(event: EmailSentEvent, raw_storage_path: str):
-    """Store normalized data to Neon with timeout"""
+    """Store normalized data to Neon with timeout using connection pool"""
     try:
-        # Get connection with timeout
-        conn = await asyncio.wait_for(
-            get_neon_connection(),
-            timeout=5.0
-        )
-
-        try:
+        # Get connection from pool
+        async with get_neon_connection() as conn:
             # Insert normalized data with timeout
             await asyncio.wait_for(
                 conn.execute(
@@ -222,9 +262,6 @@ async def store_to_neon(event: EmailSentEvent, raw_storage_path: str):
             )
 
             logger.info(f"🗄️ Stored to Neon: {event.message_id}")
-
-        finally:
-            await asyncio.wait_for(conn.close(), timeout=2.0)
 
     except asyncio.TimeoutError:
         logger.error(f"❌ Neon operation timeout for {event.message_id}")
@@ -257,15 +294,10 @@ async def store_email_sent(event: EmailSentEvent, raw_payload: dict):
 
 
 async def store_bounce_to_neon(event: EmailBounceEvent, raw_storage_path: str, lead_email: str):
-    """Store bounce event to Neon with timeout"""
+    """Store bounce event to Neon with timeout using connection pool"""
     try:
-        # Get connection with timeout
-        conn = await asyncio.wait_for(
-            get_neon_connection(),
-            timeout=5.0
-        )
-
-        try:
+        # Get connection from pool
+        async with get_neon_connection() as conn:
             # Insert normalized data with timeout
             await asyncio.wait_for(
                 conn.execute(
@@ -289,9 +321,6 @@ async def store_bounce_to_neon(event: EmailBounceEvent, raw_storage_path: str, l
             )
 
             logger.info(f"🗄️ Stored bounce to Neon: {lead_email}")
-
-        finally:
-            await asyncio.wait_for(conn.close(), timeout=2.0)
 
     except asyncio.TimeoutError:
         logger.error(f"❌ Neon bounce operation timeout for {lead_email}")
@@ -426,16 +455,17 @@ async def root():
     """Health check endpoint"""
     return {
         "service": "SmartLead Webhook Receiver",
-        "version": "2.0.0",
+        "version": "2.2.0",
         "status": "running",
         "storage": {
             "r2": R2_BUCKET_NAME,
-            "neon": "connected" if NEON_DATABASE_URL else "not configured"
+            "neon": "connected" if NEON_DATABASE_URL else "not configured",
+            "connection_pool": "active" if neon_pool else "not initialized"
         },
         "endpoints": {
             "email_sent": "/webhooks/email-sent",
             "email_bounce": "/webhooks/email-bounce",
-            "health": "/"
+            "health": "/health"
         }
     }
 
@@ -443,11 +473,21 @@ async def root():
 @app.get("/health")
 async def health():
     """Detailed health check"""
+    pool_status = {
+        "configured": neon_pool is not None,
+        "min_size": 2,
+        "max_size": 10
+    }
+    if neon_pool is not None:
+        pool_status["current_size"] = neon_pool.get_size()
+        pool_status["available"] = neon_pool.get_idle_size()
+
     return {
         "status": "healthy",
         "storage": {
             "r2": R2_BUCKET_NAME,
-            "neon": "configured" if NEON_DATABASE_URL else "missing"
+            "neon": "configured" if NEON_DATABASE_URL else "missing",
+            "connection_pool": pool_status
         }
     }
 
